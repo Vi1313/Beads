@@ -93,7 +93,35 @@ func determineAutoRoutedRepoPath(ctx context.Context, store storage.DoltStorage)
 
 // openRoutedReadStore opens the auto-routed target store for read commands.
 // Returns routed=false when reads should stay in the current store.
+//
+// For write-intent callers (bd close / bd reopen / bd update / etc. targeting
+// an issue that lives in the contributor planning store), use
+// openRoutedWriteStore instead — opening read-only here is what produces
+// `embeddeddolt: store is read-only` when the write transaction commits
+// (beads-rgw: bd close Notes-935.10.7 from a contributor workspace whose
+// .beads/config.yaml declares `additional: ~/.beads-planning` and has no
+// routes.jsonl).
 func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storage.DoltStorage, bool, error) {
+	return openRoutedStore(ctx, store, false)
+}
+
+// openRoutedWriteStore opens the auto-routed target store writable so a
+// mutating command (bd close, bd reopen, bd update, …) can commit on the
+// target store's head. Mirrors the prefix-routed write-intent path
+// resolveViaPrefixRoutingMode(_, _, /*forWrite=*/true) (#4141) so contributor
+// auto-routing has the same write-through behavior — the original GH#2345
+// design always intended close/update to write through the routed target
+// (cmd/bd/info.go: "FIX: Contributor auto-routing fallback for show/update/close
+// (GH#2345)").
+func openRoutedWriteStore(ctx context.Context, store storage.DoltStorage) (storage.DoltStorage, bool, error) {
+	return openRoutedStore(ctx, store, true)
+}
+
+// openRoutedStore is the shared implementation behind openRoutedReadStore and
+// openRoutedWriteStore. Returns routed=false (with a nil store and nil error)
+// when no auto-routing is configured, so callers can keep operating on the
+// local store.
+func openRoutedStore(ctx context.Context, store storage.DoltStorage, forWrite bool) (storage.DoltStorage, bool, error) {
 	repoPath := determineAutoRoutedRepoPath(ctx, store)
 	if repoPath == "" || repoPath == "." {
 		return nil, false, nil
@@ -101,7 +129,12 @@ func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storag
 
 	targetRepoPath := routing.ExpandPath(repoPath)
 	targetBeadsDir := filepath.Join(targetRepoPath, ".beads")
-	targetStore, err := newReadOnlyStoreFromConfig(ctx, targetBeadsDir)
+
+	open := newReadOnlyStoreFromConfig
+	if forWrite {
+		open = newDoltStoreFromConfig
+	}
+	targetStore, err := open(ctx, targetBeadsDir)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open routed store at %s: %w", targetRepoPath, err)
 	}

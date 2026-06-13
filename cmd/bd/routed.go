@@ -86,10 +86,13 @@ func resolveAndGetIssueWithRoutingMode(ctx context.Context, localStore storage.D
 	}
 
 	// If not found via prefix routing, try contributor auto-routing as fallback (GH#2345).
-	// Auto-routed stores stay read-only even for write-intent callers: this
-	// path hydrates foreign contributor projects, which must never be mutated.
+	// Write-intent callers open the routed target writable so the write commits
+	// on the target head — matching the prefix-routed write path (#4141) and
+	// the original GH#2345 design that included close/update. Opening read-only
+	// here produced `embeddeddolt: store is read-only` for `bd close` on an
+	// auto-routed contributor planning store (beads-rgw).
 	if isNotFoundErr(err) {
-		if autoResult, autoErr := resolveViaAutoRouting(ctx, localStore, id); autoErr == nil {
+		if autoResult, autoErr := resolveViaAutoRoutingMode(ctx, localStore, id, forWrite); autoErr == nil {
 			return autoResult, nil
 		}
 	}
@@ -122,8 +125,23 @@ func resolveAndGetFromStore(ctx context.Context, s storage.DoltStorage, id strin
 // resolveViaAutoRouting attempts to find an issue using contributor auto-routing.
 // This is the fallback when the local store doesn't have the issue (GH#2345).
 // Returns a RoutedResult if the issue is found in the auto-routed store.
+//
+// Opens the routed target read-only. Mutating commands must call
+// resolveViaAutoRoutingForWrite instead so the write commits through the
+// routed store (beads-rgw, mirrors prefix-routed #4141).
 func resolveViaAutoRouting(ctx context.Context, localStore storage.DoltStorage, id string) (*RoutedResult, error) {
-	routedStore, routed, err := openRoutedReadStore(ctx, localStore)
+	return resolveViaAutoRoutingMode(ctx, localStore, id, false)
+}
+
+// resolveViaAutoRoutingMode is resolveViaAutoRouting with an explicit
+// store-open mode. forWrite opens the routed target writable so a downstream
+// write transaction can commit on it.
+func resolveViaAutoRoutingMode(ctx context.Context, localStore storage.DoltStorage, id string, forWrite bool) (*RoutedResult, error) {
+	open := openRoutedReadStore
+	if forWrite {
+		open = openRoutedWriteStore
+	}
+	routedStore, routed, err := open(ctx, localStore)
 	if err != nil || !routed {
 		return nil, fmt.Errorf("no auto-routed store available")
 	}

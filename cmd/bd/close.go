@@ -594,7 +594,7 @@ func resolveCloseTargets(ctx context.Context, localStore storage.DoltStorage, id
 			return nil, fmt.Errorf("no auto-routed store available")
 		}
 		sharedRoutedTried = true
-		rs, routed, err := openRoutedReadStore(ctx, localStore)
+		rs, routed, err := openRoutedWriteStore(ctx, localStore)
 		if err != nil {
 			return nil, err
 		}
@@ -615,7 +615,11 @@ func resolveCloseTargets(ctx context.Context, localStore storage.DoltStorage, id
 		}
 		// Write-intent: a prefix-routed target opens writable so the close
 		// commits on the target head (#4141). Contributor auto-routing below
-		// stays read-only: it hydrates foreign projects that must not be mutated.
+		// is also write-intent (beads-rgw) — the close commits through the
+		// routed planning store. Earlier, this path opened the routed store
+		// read-only, which failed at write time with
+		// `embeddeddolt: store is read-only` on embedded-mode planning
+		// workspaces such as ~/.beads-planning.
 		if r, err := resolveViaPrefixRoutingMode(ctx, id, true); err == nil {
 			results = append(results, r)
 			continue
