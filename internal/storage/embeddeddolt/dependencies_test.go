@@ -3,9 +3,16 @@
 package embeddeddolt_test
 
 import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -345,4 +352,173 @@ func TestAddDependency(t *testing.T) {
 			t.Errorf("expected cross-type error message, got: %v", err)
 		}
 	})
+}
+
+func TestDependencyOpsOnSplitTargetSchemaWithoutDependsOnID(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+
+	ctx := t.Context()
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, "", "")
+	if err != nil {
+		t.Fatalf("OpenSQL: %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE compatdb"); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "USE compatdb"); err != nil {
+		t.Fatalf("use database: %v", err)
+	}
+	if _, err := schema.MigrateUpTo(ctx, conn, 49); err != nil {
+		t.Fatalf("MigrateUpTo(49): %v", err)
+	}
+	createMinimalIgnoredSplitDependencySchema(t, ctx, conn)
+
+	assertColumnAbsent(t, ctx, conn, "dependencies", "depends_on_id")
+	assertColumnAbsent(t, ctx, conn, "wisp_dependencies", "depends_on_id")
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, issue := range []*types.Issue{
+		{ID: "bd-compat-parent", Title: "Parent", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic},
+		{ID: "bd-compat-child", Title: "Child", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: "bd-compat-blocker", Title: "Blocker", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+	} {
+		if err := seedCompatIssue(ctx, tx, issue); err != nil {
+			t.Fatalf("seed issue %s: %v", issue.ID, err)
+		}
+	}
+
+	for _, dep := range []*types.Dependency{
+		{IssueID: "bd-compat-child", DependsOnID: "bd-compat-parent", Type: types.DepParentChild},
+		{IssueID: "bd-compat-child", DependsOnID: "bd-compat-blocker", Type: types.DepBlocks},
+	} {
+		if err := issueops.AddDependencyInTx(ctx, tx, dep, "tester", issueops.AddDependencyOpts{}); err != nil {
+			t.Fatalf("AddDependencyInTx(%s -> %s): %v", dep.IssueID, dep.DependsOnID, err)
+		}
+	}
+
+	deps, err := issueops.GetDependencyRecordsForIssuesInTx(ctx, tx, []string{"bd-compat-child"})
+	if err != nil {
+		t.Fatalf("GetDependencyRecordsForIssuesInTx: %v", err)
+	}
+	if got := depTargets(deps["bd-compat-child"]); !sameStringSet(got, []string{"bd-compat-blocker", "bd-compat-parent"}) {
+		t.Fatalf("dependency targets = %v, want blocker and parent", got)
+	}
+
+	cycles, err := issueops.DetectCyclesInTx(ctx, tx)
+	if err != nil {
+		t.Fatalf("DetectCyclesInTx: %v", err)
+	}
+	if len(cycles) != 0 {
+		t.Fatalf("cycles = %v, want none", cycles)
+	}
+
+	children, err := issueops.GetChildrenOfIssuesInTx(ctx, tx, []string{"bd-compat-parent"})
+	if err != nil {
+		t.Fatalf("GetChildrenOfIssuesInTx: %v", err)
+	}
+	if !sameStringSet(children, []string{"bd-compat-child"}) {
+		t.Fatalf("children = %v, want bd-compat-child", children)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+func seedCompatIssue(ctx context.Context, tx *sql.Tx, issue *types.Issue) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO issues (
+			id, title, description, design, acceptance_criteria, notes,
+			status, priority, issue_type, created_by, owner
+		) VALUES (?, ?, '', '', '', '', ?, ?, ?, 'tester', 'tester')
+	`, issue.ID, issue.Title, string(issue.Status), issue.Priority, string(issue.IssueType))
+	return err
+}
+
+func createMinimalIgnoredSplitDependencySchema(t *testing.T, ctx context.Context, db schema.DBConn) {
+	t.Helper()
+
+	if _, err := db.ExecContext(ctx, `
+		ALTER TABLE wisps ADD COLUMN is_blocked TINYINT(1) NOT NULL DEFAULT 0
+	`); err != nil && !strings.Contains(err.Error(), "Duplicate column") {
+		t.Fatalf("add wisps.is_blocked: %v", err)
+	}
+
+	_, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS wisp_dependencies (
+			id CHAR(36) NOT NULL PRIMARY KEY,
+			issue_id VARCHAR(255) NOT NULL,
+			depends_on_issue_id VARCHAR(255) NULL,
+			depends_on_wisp_id VARCHAR(255) NULL,
+			depends_on_external VARCHAR(255) NULL,
+			type VARCHAR(32) NOT NULL DEFAULT 'blocks',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_by VARCHAR(255) NOT NULL,
+			metadata JSON DEFAULT (JSON_OBJECT()),
+			thread_id VARCHAR(255) DEFAULT '',
+			UNIQUE KEY uk_wisp_dep_issue_target (issue_id, depends_on_issue_id),
+			UNIQUE KEY uk_wisp_dep_wisp_target (issue_id, depends_on_wisp_id),
+			UNIQUE KEY uk_wisp_dep_external_target (issue_id, depends_on_external)
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create wisp_dependencies: %v", err)
+	}
+}
+
+func assertColumnAbsent(t *testing.T, ctx context.Context, db schema.DBConn, table, column string) {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+	`, table, column).Scan(&count); err != nil {
+		t.Fatalf("column probe %s.%s: %v", table, column, err)
+	}
+	if count != 0 {
+		t.Fatalf("%s.%s exists, want absent", table, column)
+	}
+}
+
+func depTargets(deps []*types.Dependency) []string {
+	targets := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		targets = append(targets, dep.DependsOnID)
+	}
+	return targets
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(got))
+	for _, v := range got {
+		counts[v]++
+	}
+	for _, v := range want {
+		if counts[v] == 0 {
+			return false
+		}
+		counts[v]--
+	}
+	return true
 }

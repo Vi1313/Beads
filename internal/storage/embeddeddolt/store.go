@@ -298,6 +298,16 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 	// Embedded mode relies on the dolthub/driver/v2's local file/concurrency
 	// controls; schema.MigrateUpWithLock requires a sql-server session lock.
 	if _, err := schema.MigrateUp(ctx, conn); err != nil {
+		ok, current, tables, deferErr := schema.CanDeferAuxDefaultMigrationBlock(ctx, conn, err)
+		if deferErr != nil {
+			return fmt.Errorf("embeddeddolt: inspect deferred migration block: %w", deferErr)
+		}
+		if ok {
+			fmt.Fprintf(os.Stderr,
+				"Warning: deferring aux-table schema hardening migrations on dirty table(s) %s; continuing on schema v%d. Commit or clean those tables, then run `bd migrate`.\n",
+				strings.Join(tables, ", "), current)
+			return nil
+		}
 		return fmt.Errorf("embeddeddolt: migrate: %w", err)
 	}
 

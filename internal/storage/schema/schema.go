@@ -74,6 +74,50 @@ func IsSchemaSkewError(err error) bool {
 	return errors.As(err, &e)
 }
 
+// DirtyMigrationTablesError is returned when pending schema migrations would
+// touch tables that were already dirty before the migration pass started.
+type DirtyMigrationTablesError struct {
+	Tables []string
+}
+
+func (e *DirtyMigrationTablesError) Error() string {
+	return fmt.Sprintf("pending schema migrations alter pre-existing dirty tables: %s", strings.Join(e.Tables, ", "))
+}
+
+// CanDeferAuxDefaultMigrationBlock reports whether a dirty-table migration
+// block can be deferred while still allowing the current binary to operate on
+// the existing schema. This is deliberately narrow: v49 already has the split
+// dependency target schema that current dependency code needs, and the aux
+// tables below are blocked only by the 0051 DEFAULT(UUID()) hardening migration.
+func CanDeferAuxDefaultMigrationBlock(ctx context.Context, db DBConn, err error) (bool, int, []string, error) {
+	var dirtyErr *DirtyMigrationTablesError
+	if !errors.As(err, &dirtyErr) {
+		return false, 0, nil, nil
+	}
+	current, readErr := CurrentVersion(ctx, db)
+	if readErr != nil {
+		return false, 0, dirtyErr.Tables, readErr
+	}
+	if current < 49 {
+		return false, current, dirtyErr.Tables, nil
+	}
+	for _, table := range dirtyErr.Tables {
+		if !isAuxDefaultHardeningTable(table) {
+			return false, current, dirtyErr.Tables, nil
+		}
+	}
+	return true, current, dirtyErr.Tables, nil
+}
+
+func isAuxDefaultHardeningTable(table string) bool {
+	switch table {
+	case "events", "comments", "issue_snapshots", "compaction_snapshots":
+		return true
+	default:
+		return false
+	}
+}
+
 // checkSchemaSkew queries the DB's current schema version and returns a
 // *SchemaSkewError if the DB is ahead of the binary. Returns nil for a fresh
 // DB (version=0) or when BD_IGNORE_SCHEMA_SKEW=1 (prints a warning instead).
@@ -292,7 +336,7 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 		return 0, fmt.Errorf("checking dirty tables against pending migrations: %w", err)
 	}
 	if len(touchedDirtyTables) > 0 {
-		return 0, fmt.Errorf("pending schema migrations alter pre-existing dirty tables: %s", strings.Join(touchedDirtyTables, ", "))
+		return 0, &DirtyMigrationTablesError{Tables: touchedDirtyTables}
 	}
 	dirtyBeforeSignatures, err := dirtyTableSignatures(ctx, db, dirtyBefore)
 	if err != nil {
